@@ -3,6 +3,7 @@ import { api } from '../../../scripts/api.js';
 
 const MAX_IMAGES = 128;
 const base = '/magik/4-references/presets';
+const FAVORITE_MIME = 'application/x-magik-favorite';  // own type, so card/output drops never mistake a favourite for an image
 const queueRandomizers = new Set();
 let queueHookInstalled = false;
 function installQueueHook() {
@@ -21,10 +22,13 @@ function installQueueHook() {
 
 async function request(url, options) {
     const response = await api.fetchApi(url, options);
-    if (response.status === 404 && url === '/magik/4-references/upload') throw new Error('Restart ComfyUI to enable the updated Magik image upload handler, then refresh the browser.');
-    const data = await response.json();
-    if (!response.ok) {
-        const error = new Error(data.error || `Request failed (${response.status})`);
+    let data = null;
+    try { data = await response.json(); } catch { /* body is not JSON: stale backend, proxy error page, ... */ }
+    if (!response.ok || data === null) {
+        // A 404 without a JSON body means the route does not exist: the Python module was not (re)loaded.
+        const stale = response.status === 404 && data === null;
+        const error = new Error(stale ? 'This Magik endpoint was not found. Restart ComfyUI so the updated Python module loads, then hard-refresh the browser.'
+            : data?.error || (response.ok ? 'Unexpected response from ComfyUI (not JSON).' : `Request failed (${response.status})`));
         error.status = response.status;
         throw error;
     }
@@ -59,7 +63,7 @@ function randomSample(items, count = 4) {
 app.registerExtension({
     name: 'Magik.4ReferencesImages',
     async beforeRegisterNodeDef(type, data) {
-        if (!['Magik4ReferencesImages', 'Magik6ReferencesImages', 'Magik8ReferencesImages', 'Magik9ReferencesImages', 'MagikReferencesImages', 'Magik References Images'].includes(data.name)) return;
+        if (!['Magik4ReferencesImages', 'Magik6ReferencesImages', 'Magik8ReferencesImages', 'Magik9ReferencesImages'].includes(data.name)) return;
         const imageCount = Array.isArray(data.output) ? data.output.filter(value => value === 'IMAGE').length : 0;
         const portCount = imageCount === 9 || data.name === 'Magik9ReferencesImages' ? 9 : imageCount === 8 || data.name === 'Magik8ReferencesImages' ? 8 : imageCount === 6 || data.name === 'Magik6ReferencesImages' ? 6 : 4;
         const portNumbers = Array.from({length: portCount}, (_, i) => i + 1);
@@ -72,11 +76,30 @@ app.registerExtension({
             const extra = node.widgets.find(w => w.name === 'extra_references');
             const titleField = node.widgets.find(w => w.name === 'title');
             const pinField = node.widgets.find(w => w.name === 'pinned_outputs');
-            const readPins = () => { try { const values = JSON.parse(pinField.value || '[]'); return Array.from({length: portCount}, (_, i) => typeof values?.[i] === 'string' ? values[i] : null); } catch { return Array(portCount).fill(null); } };
-            const isPinned = i => readPins()[i] !== null;
+            // Parsed widget strings are memoised on the raw value: refresh() asks for them hundreds of times.
+            let pinsRaw = null, pinsParsed = [];
+            const pinList = () => {
+                const raw = pinField.value || '[]';
+                if (raw !== pinsRaw) {
+                    pinsRaw = raw;
+                    try { const values = JSON.parse(raw); pinsParsed = Array.from({length: portCount}, (_, i) => typeof values?.[i] === 'string' ? values[i] : null); } catch { pinsParsed = Array(portCount).fill(null); }
+                }
+                return pinsParsed;
+            };
+            const readPins = () => pinList().slice();  // callers get a copy they may edit
+            const isPinned = i => pinList()[i] !== null;
             const descriptionField = node.widgets.find(w => w.name === 'description');
             const outputs = portNumbers.map(i => node.widgets.find(w => w.name === `output_${i}`));
-            const readExtra = () => { try { const value = JSON.parse(extra.value || '[]'); return Array.isArray(value) ? value.slice(0, MAX_IMAGES - portCount).map(path => typeof path === 'string' ? path : '') : []; } catch { return []; } };
+            let extraRaw = null, extraParsed = [];
+            const extraList = () => {
+                const raw = extra.value || '[]';
+                if (raw !== extraRaw) {
+                    extraRaw = raw;
+                    try { const value = JSON.parse(raw); extraParsed = Array.isArray(value) ? value.slice(0, MAX_IMAGES - portCount).map(path => typeof path === 'string' ? path : '') : []; } catch { extraParsed = []; }
+                }
+                return extraParsed;
+            };
+            const readExtra = () => extraList().slice();
             const dragToken = `magik-${Date.now()}-${Math.random()}`;
             const dragType = 'application/x-magik-reference';
             let activeOutput = 0;
@@ -85,22 +108,29 @@ app.registerExtension({
                 const match = /^image_(\d+)$/.exec(node.inputs[index].name);
                 if (match && Number(match[1]) > portCount) node.removeInput(index);
             }
-            [...fields, extra, ...outputs, titleField, descriptionField, pinField].forEach(field => {
+            // These widgets only carry data (edited through the panel below), so hide them in every renderer:
+            // the legacy canvas trick (type/computeSize/draw), plus the `hidden` flags that newer frontends and
+            // Nodes 2.0 honour. Each flag is guarded because some frontends expose `hidden` as getter-only.
+            const hideDataWidget = field => {
                 field.type = 'converted-widget'; field.computeSize = () => [0, -4]; field.draw = () => {};
-            });
+                try { field.options = {...field.options, hidden: true}; }
+                catch { try { field.options.hidden = true; } catch { /* options not writable */ } }
+                try { field.hidden = true; } catch { /* getter-only: options.hidden covers it */ }
+            };
+            [...fields, extra, ...outputs, titleField, descriptionField, pinField].forEach(hideDataWidget);
             const root = document.createElement('div'); root.className = 'magik-four-refs';
             let scheduleFit = () => {};
-            element('style', root).textContent = `.magik-four-refs{position:relative;min-width:0;max-width:100%;box-sizing:border-box;padding:10px;background:#20232a;color:#eee;font:13px sans-serif;width:100%;height:auto;overflow:visible;pointer-events:auto}.magik-four-refs *{box-sizing:border-box}.magik-four-refs input,.magik-four-refs textarea,.magik-four-refs select,.magik-four-refs button{background:#343944;color:#eee;border:1px solid #606878;border-radius:5px;padding:6px;min-width:0}.magik-four-refs button{cursor:pointer}.magik-four-refs button:hover{background:#485268}.magik-four-refs button:disabled{opacity:.5;cursor:default}.magik-four-refs .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.magik-four-refs .image-cards{grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-rows:1fr;align-items:stretch}.magik-four-refs .add-card{min-width:0;aspect-ratio:auto;align-self:stretch;font-size:42px;border:2px dashed #65718a;background:#292e38}.magik-four-refs .card{padding:8px;border:1px solid #555d6b;border-radius:7px;min-width:0;display:flex;flex-direction:column;gap:5px}.magik-four-refs .card-header{display:flex;align-items:center;justify-content:space-between;gap:6px}.magik-four-refs .card-header button{padding:3px 7px;font-size:11px}.magik-four-refs .preview{position:relative;width:100%;aspect-ratio:1/1;background:#15171b;border-radius:5px;overflow:hidden;flex:none}.magik-four-refs .card .preview img,.magik-four-refs .output-mosaic .preview img{position:absolute;inset:0;width:100%;height:100%;margin:0;object-fit:contain}.magik-four-refs .card .row{margin-top:0;align-items:center}.magik-four-refs .card .row button{padding:5px;font-size:11px;white-space:nowrap}.magik-four-refs .card .row select{padding:5px;font-size:11px}.magik-four-refs .card.over{border-color:#e5bd58}.magik-four-refs img{display:block;width:100%;height:110px;object-fit:contain;background:#15171b;margin:6px 0}.magik-four-refs .row{display:flex;gap:6px;margin-top:8px}.magik-four-refs .row input,.magik-four-refs select{flex:1;width:100%}.magik-four-refs .filename{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:#b8c4d8}.magik-four-refs .gallery{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.magik-four-refs .mini{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:3px;width:100%;margin-top:5px}.magik-four-refs .preset-cell{position:relative;aspect-ratio:1/1;min-width:0;background:#15171b;overflow:hidden}.magik-four-refs .mini img{position:absolute;inset:0;width:100%;height:100%;margin:0;object-fit:contain}.magik-four-refs .output-mosaic{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;width:100%;margin-bottom:10px}.magik-four-refs .output-mosaic .preview{border:2px solid #505969;cursor:pointer;min-width:0}.magik-four-refs .output-mosaic .preview.output-active{border-color:#69cfff;box-shadow:0 0 0 2px #69cfff66}.magik-four-refs .output-mosaic .preview:focus-visible{outline:2px solid #fff}.magik-four-refs .output-tile{display:flex;flex-direction:column;gap:5px;min-width:0}.magik-four-refs .output-badge{display:block;text-align:center;font-size:11px;line-height:1.4;overflow-wrap:anywhere}.magik-four-refs .output-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#aebbd0;font-size:12px}.magik-four-refs .gallery{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.magik-four-refs .preset{overflow:hidden;text-align:left}.magik-four-refs .preset.active{border-color:#e5bd58}`;
+            element('style', root).textContent = `.magik-four-refs{position:relative;min-width:0;max-width:100%;box-sizing:border-box;padding:10px;background:#20232a;color:#eee;font:13px sans-serif;width:100%;height:auto;overflow:visible;pointer-events:auto}.magik-four-refs *{box-sizing:border-box}.magik-four-refs input,.magik-four-refs textarea,.magik-four-refs select,.magik-four-refs button{background:#343944;color:#eee;border:1px solid #606878;border-radius:5px;padding:6px;min-width:0}.magik-four-refs button{cursor:pointer}.magik-four-refs button:hover{background:#485268}.magik-four-refs button:disabled{opacity:.5;cursor:default}.magik-four-refs .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.magik-four-refs .image-cards{grid-template-columns:repeat(4,minmax(0,1fr));grid-auto-rows:1fr;align-items:stretch}.magik-four-refs .add-card{min-width:0;aspect-ratio:auto;align-self:stretch;font-size:42px;border:2px dashed #65718a;background:#292e38}.magik-four-refs .card{padding:8px;border:1px solid #555d6b;border-radius:7px;min-width:0;display:flex;flex-direction:column;gap:5px}.magik-four-refs .card-header{display:flex;align-items:center;justify-content:space-between;gap:6px}.magik-four-refs .card-header button{padding:3px 7px;font-size:11px}.magik-four-refs .preview{position:relative;width:100%;aspect-ratio:1/1;background:#15171b;border-radius:5px;overflow:hidden;flex:none}.magik-four-refs .card .preview img,.magik-four-refs .output-mosaic .preview img{position:absolute;inset:0;width:100%;height:100%;margin:0;object-fit:contain}.magik-four-refs .card .row{margin-top:0;align-items:center}.magik-four-refs .card .row button{padding:5px;font-size:11px;white-space:nowrap}.magik-four-refs .card .row select{padding:5px;font-size:11px}.magik-four-refs .card.over{border-color:#e5bd58}.magik-four-refs img{display:block;width:100%;height:110px;object-fit:contain;background:#15171b;margin:6px 0}.magik-four-refs .row{display:flex;gap:6px;margin-top:8px}.magik-four-refs .row input,.magik-four-refs select{flex:1;width:100%}.magik-four-refs .filename{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:#b8c4d8}.magik-four-refs .gallery{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:8px}.magik-four-refs .mini{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:3px;width:100%;margin-top:5px}.magik-four-refs .preset-cell{position:relative;aspect-ratio:1/1;min-width:0;background:#15171b;overflow:hidden}.magik-four-refs .mini img{position:absolute;inset:0;width:100%;height:100%;margin:0;object-fit:contain}.magik-four-refs .output-mosaic{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;width:100%;margin-bottom:10px}.magik-four-refs .output-mosaic .preview{border:2px solid #505969;cursor:pointer;min-width:0}.magik-four-refs .output-mosaic .preview.output-active{border-color:#69cfff;box-shadow:0 0 0 2px #69cfff66}.magik-four-refs .output-mosaic .preview:focus-visible{outline:2px solid #fff}.magik-four-refs .output-tile{display:flex;flex-direction:column;gap:5px;min-width:0}.magik-four-refs .output-badge{display:block;text-align:center;font-size:11px;line-height:1.4;overflow-wrap:anywhere}.magik-four-refs .output-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#aebbd0;font-size:12px}.magik-four-refs .preset{overflow:hidden;text-align:left}.magik-four-refs .preset.active{border-color:#e5bd58}.magik-four-refs .favs-box{margin-top:8px}.magik-four-refs .favs-title{font-size:12px;color:#e5bd58;margin-bottom:4px}.magik-four-refs .favs{display:flex;flex-wrap:wrap;gap:6px}.magik-four-refs .favs-hint{font-size:11px;color:#9aa4b2}.magik-four-refs .fav{display:flex;align-items:center;gap:6px;max-width:100%;padding:3px 4px 3px 3px;background:#2b2f38;border:1px solid #606878;border-radius:6px;cursor:pointer;user-select:none}.magik-four-refs .fav:hover,.magik-four-refs .fav:focus-visible{border-color:#8fa3c9;outline:none}.magik-four-refs .fav.active{border-color:#e5bd58}.magik-four-refs .fav.drop{outline:2px dashed #e5bd58}.magik-four-refs .fav img{width:34px;height:34px;margin:0;object-fit:cover;border-radius:4px;background:#15171b;flex:none}.magik-four-refs .fav-empty{display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:4px;background:#15171b;color:#9aa4b2;flex:none}.magik-four-refs .fav-name{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#eee}.magik-four-refs .fav-unstar{padding:0 4px;font-size:12px;line-height:1.4;background:none;border:0;color:#e5bd58;cursor:pointer}/* ---- layout v2: sections, one button hierarchy, responsive grids ---- */.magik-four-refs{display:flex;flex-direction:column;gap:10px;line-height:1.35;--accent:#4f8cff;--gold:#e5bd58;--line:rgba(255,255,255,.09);--panel:rgba(0,0,0,.22);--muted:#9aa4b2}.magik-four-refs button{background:#3a4050;color:#e8ecf2;border:1px solid #566075;border-radius:6px;padding:6px 10px;font-size:12px;line-height:1.2;transition:background .12s,border-color .12s}.magik-four-refs button:hover:not(:disabled){background:#454d62;border-color:#7a86a0}.magik-four-refs button:disabled{opacity:.45;cursor:default}.magik-four-refs button.primary{background:var(--accent);border-color:#78a8ff;color:#fff;font-weight:600}.magik-four-refs button.primary:hover:not(:disabled){background:#6a9fff;border-color:#a3c3ff}.magik-four-refs button.danger{color:#ff9d97;border-color:#7b4a49;background:#3b2f33}.magik-four-refs button.danger:hover:not(:disabled){background:#5a3336;border-color:#c0615c}.magik-four-refs button.ghost{background:transparent;border-color:transparent;color:var(--muted)}.magik-four-refs button.ghost:hover:not(:disabled){background:rgba(255,255,255,.08);color:#fff;border-color:transparent}.magik-four-refs button:focus-visible,.magik-four-refs input:focus-visible,.magik-four-refs select:focus-visible,.magik-four-refs textarea:focus-visible,.magik-four-refs summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.magik-four-refs input[type=checkbox]{flex:none;width:16px;height:16px;margin:0;padding:0;accent-color:var(--accent)}.magik-four-refs .row{margin-top:0}.magik-four-refs .section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;min-width:0}.magik-four-refs .section>*+*{margin-top:8px}.magik-four-refs .section-title,.magik-four-refs .description-row>div:first-child,.magik-four-refs .presets>summary{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}.magik-four-refs .title-input{display:block;width:100%;font-size:22px;font-weight:600;text-align:center;padding:8px 10px;border-radius:8px;text-overflow:ellipsis}.magik-four-refs .status{display:flex;align-items:center;min-height:28px;font-size:12px;padding:4px 10px;white-space:pre-wrap;background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:8px}.magik-four-refs .status:empty::before{content:'Ready';color:#6f7a8a}.magik-four-refs .output-mosaic{margin-bottom:0}.magik-four-refs .toolbar{flex-wrap:wrap;align-items:center}.magik-four-refs .toolbar-hint{flex:1 0 100%;font-size:12px;color:var(--muted)}.magik-four-refs .toolbar button:nth-of-type(3){margin-left:auto}.magik-four-refs .options{display:flex;flex-wrap:wrap;gap:6px 18px}.magik-four-refs .toggle{display:inline-flex;align-items:center;gap:7px;margin:0;cursor:pointer;color:#d3d9e4;font-size:12px}.magik-four-refs .collection-row{align-items:center}.magik-four-refs .collection-row .count{flex:1;color:var(--muted);font-size:12px}.magik-four-refs .image-cards{grid-template-columns:repeat(auto-fill,minmax(112px,1fr));grid-auto-rows:auto}.magik-four-refs .card-header{flex-wrap:wrap;justify-content:flex-start;gap:4px}.magik-four-refs .card-header strong{flex:1 0 100%;font-size:12px}.magik-four-refs .card-header button{flex:0 0 auto}.magik-four-refs .card-header button:nth-of-type(2){flex:1 1 0}.magik-four-refs .add-card{grid-column:1/-1;align-self:auto;min-height:0;height:34px;aspect-ratio:auto;font-size:12px;color:var(--muted);border-width:1px}.magik-four-refs .presets>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;user-select:none}.magik-four-refs .presets>summary::-webkit-details-marker{display:none}.magik-four-refs .presets>summary::before{content:'\u25b8';transition:transform .12s}.magik-four-refs .presets[open]>summary::before{transform:rotate(90deg)}.magik-four-refs .presets .favs-box{margin-top:0}.magik-four-refs .gallery{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));margin-top:0}.magik-four-refs .preset-row{flex-wrap:wrap}.magik-four-refs .preset-row select{flex:1 1 150px;min-width:150px}.magik-four-refs .card-header button{padding:3px 5px}.magik-four-refs .preset>div:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}`;
             const titleRow = element('div', root); titleRow.className = 'title-row';
-            titleRow.style.cssText = 'width:100%;margin-bottom:10px';
-            const titleInput = element('input', titleRow); titleInput.type = 'text'; titleInput.placeholder = 'Title…';
+            titleRow.style.cssText = 'width:100%';
+            const titleInput = element('input', titleRow); titleInput.type = 'text'; titleInput.placeholder = 'Collection title…';
             titleInput.maxLength = 512; titleInput.value = titleField.value || '';
             titleInput.setAttribute('aria-label', 'Reference collection title');
-            titleInput.style.cssText = 'display:block;width:100%;font-size:66px;font-weight:600;text-align:center;padding:10px 12px';
+            titleInput.className = 'title-input';
             titleInput.oninput = () => { titleField.value = titleInput.value; node.setDirtyCanvas(true, true); scheduleFit(); };
             let viewer = null;
             const closeViewer = () => { viewer?.remove(); viewer = null; };
-            const openViewer = (path, index) => {
+            const openViewer = (path, index, label = '') => {
                 if (!path) return;
                 closeViewer();
                 viewer = document.createElement('dialog');
@@ -108,17 +138,19 @@ app.registerExtension({
                 const entries = fields.map((field, i) => ({path: field.value, index: i})).filter(item => item.path);
                 let current = entries.findIndex(item => item.path === path && item.index === index);
                 if (current < 0) current = entries.findIndex(item => item.path === path);
-                if (current < 0) { entries.unshift({path, index}); current = 0; }
+                if (current < 0) { entries.unshift({path, index, label}); current = 0; }
                 const bar = element('div', viewer); bar.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:16px';
-                const caption = element('span', bar);
-                const close = element('button', bar, 'Close'); close.onclick = closeViewer;
+                const caption = element('span', bar); caption.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+                let captionBase = '';
+                const close = element('button', bar, 'Close'); close.onclick = closeViewer; close.setAttribute('aria-label', 'Close viewer');
+                close.style.cssText = 'order:3;background:#3a4050;color:#e8ecf2;border:1px solid #566075;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer';
                 const stage = element('div', viewer); stage.style.cssText = 'position:relative;width:100%;height:calc(100% - 40px);margin-top:10px;overflow:hidden;touch-action:none';
                 const image = element('img', stage);
                 image.style.cssText = 'display:block;width:100%;height:100%;object-fit:contain;transform-origin:center;user-select:none';
                 image.draggable = false;
                 let zoom = 1, panX = 0, panY = 0, drag = null;
                 const zoomLabel = element('span', bar);
-                zoomLabel.style.whiteSpace = 'nowrap';
+                zoomLabel.style.cssText = 'order:2;white-space:nowrap;font-size:12px;color:#9aa4b2';
                 const applyView = () => {
                     const width = stage.clientWidth || stage.offsetWidth;
                     const height = stage.clientHeight || stage.offsetHeight;
@@ -133,7 +165,7 @@ app.registerExtension({
                     zoomLabel.textContent = `${Math.round(zoom * 100)}% · Wheel: zoom · Drag: pan · Double-click: reset`;
                 };
                 const resetView = () => { zoom = 1; panX = panY = 0; drag = null; applyView(); };
-                image.onload = applyView;
+                image.onload = () => { applyView(); if (image.naturalWidth) { caption.textContent = `${captionBase} · ${image.naturalWidth} × ${image.naturalHeight} px`; caption.title = caption.textContent; } };
                 stage.addEventListener('wheel', event => {
                     event.preventDefault(); event.stopPropagation();
                     const nextZoom = Math.max(1, Math.min(16, zoom * Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.04 : 0.002))));
@@ -171,8 +203,8 @@ app.registerExtension({
                 previous.style.cssText = arrowStyle + ';left:8px'; next.style.cssText = arrowStyle + ';right:8px';
                 const render = () => {
                     resetView();
-                    const entry = entries[current]; image.src = fullImage(entry.path); image.alt = `Image ${entry.index + 1}`;
-                    caption.textContent = `Image ${entry.index + 1} · ${current + 1} / ${entries.length} · ${entry.path}`;
+                    const entry = entries[current]; const name = entry.label || `Image ${entry.index + 1}`; image.src = fullImage(entry.path); image.alt = name;
+                    captionBase = `${name} · ${current + 1} / ${entries.length} · ${entry.path}`; caption.textContent = captionBase; caption.title = captionBase;
                     previous.disabled = next.disabled = entries.length < 2;
                 };
                 const move = delta => { current = (current + delta + entries.length) % entries.length; render(); };
@@ -205,13 +237,14 @@ app.registerExtension({
                 pin.ondblclick = event => event.stopPropagation();
                 pin.addEventListener('keydown', event => event.stopPropagation());
                 const badge = element('span', tile, `Output ${i + 1}`); badge.className = 'output-badge';
-                img.onload = () => { if (cell.dataset.path) empty.style.display = 'none'; };
-                img.onerror = () => { if (cell.dataset.path) { empty.textContent = 'Preview unavailable'; empty.style.display = 'flex'; } };
+                const dims = element('span', tile); dims.className = 'output-badge output-dims'; dims.style.cssText = 'color:#aebbd0;min-height:1.4em';
+                img.onload = () => { if (cell.dataset.path) { empty.style.display = 'none'; dims.textContent = `${img.naturalWidth} × ${img.naturalHeight} px`; } };
+                img.onerror = () => { dims.textContent = ''; if (cell.dataset.path) { empty.textContent = 'Preview unavailable'; empty.style.display = 'flex'; } };
                 cell.tabIndex = 0; cell.setAttribute('role', 'button');
                 cell.setAttribute('aria-label', `Activate output ${i + 1}`);
                 cell.onclick = () => { activeOutput = i; refresh(); };
                 cell.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); cell.onclick(); } };
-                cell.ondblclick = () => { if (cell.dataset.path) openViewer(cell.dataset.path, linked(i) ? i : Number(outputs[i].value) - 1); };
+                cell.ondblclick = () => { if (cell.dataset.path) openViewer(cell.dataset.path, linked(i) ? i : Number(outputs[i].value) - 1, linked(i) ? `Input ${i + 1}` : isPinned(i) ? 'Pinned image' : ''); };
                 img.style.cursor = 'grab'; img.draggable = true; cell.draggable = true;
                 cell.title = 'Drop a loaded card to assign; drag onto another output to swap selections';
                 cell.ondragstart = event => {
@@ -245,10 +278,10 @@ app.registerExtension({
                     changeSelections(next, {newActive: i});
                     message(source.kind === 'output' ? 'Output selections swapped.' : `Image ${source.index + 1} assigned to Output ${i + 1}.`);
                 };
-                return {tile, cell, img, empty, badge, pin};
+                return {tile, cell, img, empty, badge, pin, dims};
             });
-            const selectionRow = element('div', root); selectionRow.className = 'row';
-            const selectionHint = element('span', selectionRow); selectionHint.style.cssText = 'flex:1;line-height:1.4';
+            const selectionRow = element('div', root); selectionRow.className = 'row toolbar';
+            const selectionHint = element('span', selectionRow); selectionHint.className = 'toolbar-hint';
             const redoButton = element('button', selectionRow, 'Redo');
             const undoButton = element('button', selectionRow, 'Undo'); undoButton.title = 'Undo the last selection or collection edit';
             undoButton.onclick = undoSelection;
@@ -314,12 +347,14 @@ app.registerExtension({
                 enabled: () => !removed && node.properties?.magik_randomize_on_queue === true,
                 apply: prompt => {
                     const submitted = prompt.output[String(node.id)];
-                    if (!submitted?.inputs || !['Magik4ReferencesImages', 'Magik6ReferencesImages', 'Magik8ReferencesImages', 'Magik9ReferencesImages', 'MagikReferencesImages', 'Magik References Images'].includes(submitted.class_type)) return;
+                    if (!submitted?.inputs || !['Magik4ReferencesImages', 'Magik6ReferencesImages', 'Magik8ReferencesImages', 'Magik9ReferencesImages'].includes(submitted.class_type)) return;
                     // A queue caller can reuse a prompt serialized before later UI edits.
                     // Keep that job intact rather than applying new indices to an old pool.
                     const stale = portNumbers.some((n, i) =>
                         (`reference_${n}` in submitted.inputs && submitted.inputs[`reference_${n}`] !== fields[i].value) ||
-                        ((`image_${n}` in submitted.inputs || `reference_${n}` in submitted.inputs) && Array.isArray(submitted.inputs[`image_${n}`]) !== linked(i))) ||
+                        // A wired input whose upstream node is muted or bypassed is simply left out of the prompt: not stale.
+                        // A link present in the prompt but missing from the node means the node changed since serialization.
+                        (Array.isArray(submitted.inputs[`image_${n}`]) && !linked(i))) ||
                         ('extra_references' in submitted.inputs && submitted.inputs.extra_references !== extra.value) ||
                         ('pinned_outputs' in submitted.inputs && submitted.inputs.pinned_outputs !== pinField.value);
                     if (stale) { message('Queued snapshot differs from the current collection. Its original selections were kept; queue again to randomize.', true); return; }
@@ -370,8 +405,8 @@ app.registerExtension({
             };
             node.properties ??= {};
             const cardsToggle = element('button', root, 'Hide cards');
-            cardsToggle.style.cssText = 'display:block;width:100%;margin-top:8px;text-align:left';
-            const grid = element('div', root); grid.className = 'grid image-cards'; grid.style.cssText = 'margin-top:8px';
+            cardsToggle.className = 'ghost';
+            const grid = element('div', root); grid.className = 'grid image-cards';
             function updateCardsVisibility() {
                 const collapsed = node.properties?.magik_cards_collapsed === true;
                 grid.style.display = collapsed ? 'none' : 'grid';
@@ -381,20 +416,20 @@ app.registerExtension({
             }
             cardsToggle.onclick = () => { node.properties.magik_cards_collapsed = !node.properties.magik_cards_collapsed; updateCardsVisibility(); node.setDirtyCanvas(true, true); };
             const descriptionRow = element('div', root); descriptionRow.className = 'description-row';
-            descriptionRow.style.cssText = 'width:100%;margin-top:10px';
+            descriptionRow.style.cssText = 'width:100%';
             element('div', descriptionRow, 'description');
             const descriptionInput = element('textarea', descriptionRow);
             descriptionInput.setAttribute('aria-label', 'description'); descriptionInput.placeholder = 'description';
-            descriptionInput.rows = 4; descriptionInput.value = descriptionField.value || '';
-            descriptionInput.style.cssText = 'display:block;width:100%;min-height:96px;resize:vertical;font:14px/1.4 sans-serif;margin-top:5px';
+            descriptionInput.rows = 3; descriptionInput.value = descriptionField.value || '';
+            descriptionInput.style.cssText = 'display:block;width:100%;min-height:72px;resize:vertical;font:13px/1.4 sans-serif;margin-top:5px';
             descriptionInput.oninput = () => { descriptionField.value = descriptionInput.value; node.setDirtyCanvas(true, true); scheduleFit(); };
             const saveRow = element('div', root); saveRow.className = 'row';
             const name = element('input', saveRow); name.placeholder = 'Preset name…';
             const save = element('button', saveRow, 'Save');
-            const addCard = element('button', grid, '+'); addCard.className = 'add-card';
+            const addCard = element('button', grid, '+ Add image card'); addCard.className = 'add-card';
             addCard.title = 'Add an image card'; addCard.setAttribute('aria-label', 'Add an image card');
-            const previews = [], captures = [], inputCaptures = Array(portCount).fill(null);
-            const status = document.createElement('div'); status.style.cssText = 'margin-top:8px;min-height:30px;white-space:pre-wrap';
+            const previews = [], inputCaptures = Array(portCount).fill(null);
+            const status = document.createElement('div'); status.className = 'status'; status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
             const message = (text, error = false) => { status.textContent = text; status.style.color = error ? '#ff9b9b' : '#acd6af'; scheduleFit(); };
             const slotIndex = i => node.inputs?.findIndex(input => input.name === `image_${i + 1}`) ?? -1;
             const linked = i => { const index = slotIndex(i); return index >= 0 && node.inputs[index].link != null; };
@@ -406,24 +441,25 @@ app.registerExtension({
                 addCard.disabled = fields.length >= MAX_IMAGES;
                 if (fields.length >= MAX_IMAGES) addCard.remove(); else grid.append(addCard);
                 selectionHint.textContent = isPinned(activeOutput) ? `Output ${activeOutput + 1} is pinned. Unpin it to change its selection.` : linked(activeOutput) ? `Output ${activeOutput + 1} uses Input ${activeOutput + 1} directly. Disconnect it to select a loaded image.` : `Output ${activeOutput + 1} active — click a loaded image to assign it.`;
+                const pinsNow = pinList(), linkedNow = outputs.map((_, k) => linked(k)), excludedNow = exclusions();
                 fields.forEach((field, i) => {
                     const {img, label, hint, dice} = previews[i];
-                    const excluded = exclusions().has(field.value);
+                    const excluded = excludedNow.has(field.value);
                     dice.textContent = excluded ? '🎲✕' : '🎲'; dice.style.opacity = excluded ? '0.4' : '1';
                     dice.disabled = !field.value; dice.setAttribute('aria-pressed', String(excluded));
                     dice.setAttribute('aria-label', `${excluded ? 'Include' : 'Exclude'} Image ${i + 1} ${excluded ? 'in' : 'from'} randomization`);
                     dice.title = excluded ? 'Excluded from randomization — click to include' : 'Included in randomization — click to exclude';
                     const value = field.value;
                     label.textContent = value || 'Empty slot'; label.title = value || '';
-                    const assigned = outputs.map((w, k) => !linked(k) && (isPinned(k) ? readPins()[k] === field.value && !!field.value : Number(w.value) === i + 1) ? k + 1 : null).filter(Boolean);
+                    const assigned = outputs.map((w, k) => !linkedNow[k] && (pinsNow[k] !== null ? pinsNow[k] === value && !!value : Number(w.value) === i + 1) ? k + 1 : null).filter(Boolean);
                     hint.textContent = `${assigned.length ? 'Output ' + assigned.join(', ') : 'Not selected'}`;
-                    previews[i].card.style.borderColor = !linked(activeOutput) && (isPinned(activeOutput) ? readPins()[activeOutput] === field.value && !!field.value : Number(outputs[activeOutput].value) === i + 1) ? '#69cfff' : assigned.length ? '#d9ba60' : '#555d6b';
+                    previews[i].card.style.borderColor = !linkedNow[activeOutput] && (pinsNow[activeOutput] !== null ? pinsNow[activeOutput] === value && !!value : Number(outputs[activeOutput].value) === i + 1) ? '#69cfff' : assigned.length ? '#d9ba60' : '#555d6b';
                     if (value) {
                         const url = thumb(value);
                         if (img.dataset.reference !== url) { img.dataset.reference = url; img.src = url; }
                     } else { delete img.dataset.reference; img.removeAttribute('src'); }
                 });
-                outputTiles.forEach(({cell, img, empty, badge, pin}, i) => {
+                outputTiles.forEach(({cell, img, empty, badge, pin, dims}, i) => {
                     cell.className = `preview${i === activeOutput ? ' output-active' : ''}`;
                     cell.setAttribute('aria-pressed', i === activeOutput ? 'true' : 'false');
                     const index = Number(outputs[i].value) - 1;
@@ -436,23 +472,30 @@ app.registerExtension({
                     cell.dataset.path = value || '';
                     if (value) {
                         const url = fullImage(value);
-                        if (img.dataset.reference !== url) { img.dataset.reference = url; empty.textContent = 'Loading…'; empty.style.display = 'flex'; img.src = url; }
+                        if (img.dataset.reference !== url) { img.dataset.reference = url; dims.textContent = ''; empty.textContent = 'Loading…'; empty.style.display = 'flex'; img.src = url; }
                         img.style.visibility = 'visible';
                     } else {
-                        delete img.dataset.reference; img.removeAttribute('src'); img.style.visibility = 'hidden';
+                        delete img.dataset.reference; img.removeAttribute('src'); img.style.visibility = 'hidden'; dims.textContent = '';
                         empty.textContent = direct ? 'Run workflow to preview' : 'Empty'; empty.style.display = 'flex';
                     }
                 });
                 node.setDirtyCanvas(true, true);
+                persistUi();
                 scheduleFit();
             };
             const disconnect = i => { const index = slotIndex(i); if (index >= 0 && linked(i)) node.disconnectInput(index); };
+            // graph.links is a Map in newer frontends and a plain object in older ones.
+            const linkById = id => {
+                const links = node.graph?.links;
+                if (id == null || !links) return undefined;
+                return typeof links.get === 'function' ? links.get(id) : links[id];
+            };
             const undoStack = [], redoStack = [];
             const snapshot = (connectionSlot = null) => ({
                 pool: fields.map(field => field.value), indices: outputs.map(field => Number(field.value)),
                 active: activeOutput, excluded: [...exclusions()], connectionSlot, cycleKey, cycleUsed: [...cycleUsed],
                 connection: connectionSlot === null ? null : (() => {
-                    const link = node.graph?.links[node.inputs[slotIndex(connectionSlot)]?.link];
+                    const link = linkById(node.inputs[slotIndex(connectionSlot)]?.link);
                     return link ? {origin: link.origin_id, slot: link.origin_slot, capture: inputCaptures[connectionSlot]} : null;
                 })(),
             });
@@ -477,7 +520,7 @@ app.registerExtension({
                 const retained = outputs.map(field => fields[Number(field.value) - 1]?.value || '');
                 node.properties.magik_excluded_images = previous.excluded;
                 setCount(previous.pool.length);
-                previous.pool.forEach((path, i) => { fields[i].value = path; captures[i] = null; });
+                previous.pool.forEach((path, i) => { fields[i].value = path; });
                 outputs.forEach((field, i) => {
                     field.value = isPinned(i) ? Math.max(0, fields.findIndex(item => item.value === retained[i]) + 1) : previous.indices[i];
                 });
@@ -485,7 +528,7 @@ app.registerExtension({
                 cycleKey = previous.cycleKey; cycleUsed = new Set(previous.cycleUsed);
                 const slot = previous.connectionSlot;
                 if (slot !== null && !isPinned(slot)) {
-                    const current = node.graph?.links[node.inputs[slotIndex(slot)]?.link];
+                    const current = linkById(node.inputs[slotIndex(slot)]?.link);
                     const target = previous.connection;
                     if (current && (!target || current.origin_id !== target.origin || current.origin_slot !== target.slot)) disconnect(slot);
                     if (target && !linked(slot)) {
@@ -560,7 +603,6 @@ app.registerExtension({
                         if (removed || fields[i] !== field || sequence !== uploadSequence) return;
                         if (field.value !== originalPath) { message('Upload finished, but the card changed in the meantime. Its current image was kept.', true); return; }
                         remember();
-                        captures[i] = null;
                         field.value = [uploaded.subfolder, uploaded.name].filter(Boolean).join('/');
                         refresh(); message(`Image ${i + 1} loaded.`);
                     } catch (error) { message(error.message, true); }
@@ -581,14 +623,14 @@ app.registerExtension({
                     }
                     upload(event.dataTransfer.files?.[0]);
                 };
-                element('button', header, 'Clear').onclick = () => { if (!field.value) return; remember(); field.value = ''; captures[i] = null; refresh(); message(`Image ${i + 1} cleared.`); };
+                element('button', header, 'Clear').onclick = () => { if (!field.value) return; remember(); field.value = ''; refresh(); message(`Image ${i + 1} cleared.`); };
                 if (i >= portCount) {
                     const trash = element('button', header, '🗑');
                     trash.title = `Delete Image ${i + 1} card`; trash.setAttribute('aria-label', `Delete image ${i + 1} card`);
                     trash.onclick = event => { event?.stopPropagation(); deleteCard(i); };
                 }
                 const callback = field.callback;
-                field.callback = function () { const value = callback?.apply(this, arguments); captures[i] = null; refresh(); return value; };
+                field.callback = function () { const value = callback?.apply(this, arguments); refresh(); return value; };
             }
             fields.forEach(createCard);
             function setCount(count) {
@@ -597,15 +639,18 @@ app.registerExtension({
                     const i = fields.length;
                     const field = {};
                     Object.defineProperty(field, 'value', {
-                        get() { return readExtra()[i - portCount] || ''; },
-                        set(value) { const values = readExtra(); while (values.length <= i - portCount) values.push(''); values[i - portCount] = value; extra.value = JSON.stringify(values); },
+                        get() { return extraList()[i - portCount] || ''; },
+                        set(value) {
+                            const values = readExtra(); while (values.length <= i - portCount) values.push('');
+                            values[i - portCount] = typeof value === 'string' ? value : '';
+                            const raw = JSON.stringify(values); extra.value = raw; extraRaw = raw; extraParsed = values;
+                        },
                     });
                     fields.push(field); field.value = field.value;
                     createCard(field, i);
                 }
                 while (fields.length > count) {
-                    const i = fields.length - 1;
-                    previews.pop().card.remove(); fields.pop(); captures.pop();
+                    previews.pop().card.remove(); fields.pop();
                 }
                 extra.value = JSON.stringify(readExtra().slice(0, count - portCount));
                 outputs.forEach(field => { if (Number(field.value) > count) field.value = 0; });
@@ -626,10 +671,10 @@ app.registerExtension({
             function applyFolder(paths, replacing, start) {
                 remember();
                 if (replacing) {
-                    fields.forEach((field, i) => { field.value = ''; captures[i] = null; });
+                    fields.forEach(field => { field.value = ''; });
                     setCount(Math.max(portCount, paths.length));
                 } else setCount(Math.max(fields.length, start + paths.length));
-                paths.forEach((path, index) => { const i = start + index; fields[i].value = path; captures[i] = null; });
+                paths.forEach((path, index) => { fields[start + index].value = path; });
                 if (replacing) outputs.forEach((field, i) => { field.value = i < paths.length ? i + 1 : 0; });
                 refresh();
             }
@@ -690,11 +735,20 @@ app.registerExtension({
                 } catch (error) { message(error.message, true); }
                 finally { root.inert = false; loadFolder.textContent = 'Load Folder'; }
             };
+            // Favorites: a curated, ordered strip of presets that load with one click (shared by every Magik node).
+            const presetsSection = element('details', root); presetsSection.className = 'section presets'; presetsSection.open = true;
+            element('summary', presetsSection, 'Presets');
+            const favBox = element('div', root); favBox.className = 'favs-box';
+            element('div', favBox, '★ Favorites').className = 'favs-title';
+            const favList = element('div', favBox); favList.className = 'favs';
             const searchRow = element('div', root); searchRow.className = 'row';
             const search = element('input', searchRow); search.placeholder = 'Search presets…'; search.setAttribute('aria-label', 'Search presets');
             const reload = element('button', searchRow, 'Refresh');
-            const presetRow = element('div', root); presetRow.className = 'row';
+            const presetRow = element('div', root); presetRow.className = 'row preset-row';
+            const presetPrev = element('button', presetRow, '◀'); presetPrev.setAttribute('aria-label', 'Previous preset'); presetPrev.title = 'Load the previous preset'; presetPrev.style.padding = '6px 9px';
             const select = element('select', presetRow); select.setAttribute('aria-label', 'Saved presets');
+            const presetNext = element('button', presetRow, '▶'); presetNext.setAttribute('aria-label', 'Next preset'); presetNext.title = 'Load the next preset'; presetNext.style.padding = '6px 9px';
+            const star = element('button', presetRow, '☆'); star.style.padding = '6px 9px';
             const load = element('button', presetRow, 'Load');
             const rename = element('button', presetRow, 'Rename');
             const remove = element('button', presetRow, 'Delete');
@@ -716,14 +770,49 @@ app.registerExtension({
             const importButton = element('button', transferRow, 'Import ZIP…');
             const importPicker = element('input', transferRow); importPicker.type = 'file'; importPicker.accept = '.zip,application/zip'; importPicker.style.display = 'none';
             root.append(status);
-            let presets = [], sequence = 0, timer, removed = false;
+            let presets = [], favorites = [], lastLoaded = null, sequence = 0, timer, removed = false;
             const presetSamples = new Map();
+            // UI state that is not a widget value: stored in node.properties so it survives a reload.
+            // Undo/redo history and avoid-repeat cycle progress are deliberately session-only.
+            let pendingPreset = null, uiLocked = false;
+            const persistUi = () => {
+                if (uiLocked || removed) return;
+                node.properties ??= {};
+                node.properties.magik_ui = {
+                    active: activeOutput, preset: pendingPreset ?? select.value, presetName: name.value, presetsVisible, presetsOpen: presetsSection.open,
+                    folderMode: folderMode.value, folderSource: folderSource.value, folderPath: folderPath.value,
+                    inputs: inputCaptures.slice(0, portCount),
+                };
+            };
+            const restoreUi = saved => {
+                if (!saved || typeof saved !== 'object') return;
+                if (Number.isInteger(saved.active) && saved.active >= 0 && saved.active < portCount) activeOutput = saved.active;
+                if (typeof saved.presetName === 'string') name.value = saved.presetName;
+                if (typeof saved.preset === 'string' && saved.preset) {
+                    if ([...select.options].some(option => option.value === saved.preset)) select.value = saved.preset;
+                    else pendingPreset = saved.preset;
+                }
+                if (saved.folderMode === 'append' || saved.folderMode === 'replace') folderMode.value = saved.folderMode;
+                if (saved.folderSource === 'computer' || saved.folderSource === 'server') { folderSource.value = saved.folderSource; folderSource.onchange(); }
+                if (typeof saved.folderPath === 'string') folderPath.value = saved.folderPath;
+                if (saved.presetsVisible === true && !presetsVisible) presetToggle.onclick();
+                if (saved.presetsOpen === false) presetsSection.open = false;
+                if (Array.isArray(saved.inputs)) saved.inputs.slice(0, portCount).forEach((path, i) => { inputCaptures[i] = typeof path === 'string' && path && linked(i) ? path : null; });
+                drawGallery();
+            };
+            folderMode.addEventListener('change', persistUi);
+            folderSource.addEventListener('change', persistUi);
+            folderPath.addEventListener('input', persistUi);
+            name.addEventListener('input', persistUi);
+            select.addEventListener('change', persistUi);
+            presetToggle.addEventListener('click', persistUi);
+            presetsSection.addEventListener('toggle', () => { persistUi(); scheduleFit(); });
             const drawGallery = () => {
                 gallery.replaceChildren();
                 if (!presetsVisible) { scheduleFit(); return; }
                 for (const preset of presets) {
                     const card = element('button', gallery); card.className = `preset${select.value === preset.name ? ' active' : ''}`;
-                    element('div', card, `${preset.name} · ${preset.images.length} images`);
+                    element('div', card, `${preset.favorite > 0 ? '★ ' : ''}${preset.name} · ${preset.images.length} images`);
                     const strip = element('div', card); strip.className = 'mini'; strip.style.gridTemplateColumns = `repeat(${portCount === 9 ? 3 : portCount === 8 ? 4 : portCount === 6 ? 3 : 2},minmax(0,1fr))`;
                     const key = JSON.stringify([preset.name, preset.images]);
                     if (!presetSamples.has(key)) presetSamples.set(key, randomSample([...new Set(preset.images.filter(Boolean))], portCount));
@@ -739,12 +828,14 @@ app.registerExtension({
                 try {
                     const data = await request(`${base}?${new URLSearchParams({q: search.value})}`);
                     if (seq !== sequence || removed) return;
-                    presets = data.presets; presetSamples.clear(); select.replaceChildren();
+                    presets = data.presets; favorites = data.favorites || []; presetSamples.clear(); select.replaceChildren();
                     if (!presets.length) { const option = element('option', select, 'No matching presets'); option.value = ''; }
                     for (const preset of presets) { const option = element('option', select, preset.name); option.value = preset.name; }
-                    if (presets.some(p => p.name === selected)) select.value = selected;
+                    const wanted = pendingPreset ?? selected; pendingPreset = null;
+                    if (presets.some(p => p.name === wanted)) select.value = wanted;
                     load.disabled = rename.disabled = remove.disabled = !presets.length;
-                    drawGallery();
+                    presetPrev.disabled = presetNext.disabled = presets.length < 2; star.disabled = !presets.length;
+                    persistUi(); syncStar(); drawFavorites(); drawGallery();
                 } catch (error) { message(error.message, true); }
             };
             const download = async all => {
@@ -753,7 +844,7 @@ app.registerExtension({
                     if (!all && !select.value) throw new Error('Select a preset first.');
                     const query = all ? '' : `?${new URLSearchParams({name: select.value})}`;
                     const response = await api.fetchApi(`${base}/export${query}`);
-                    if (!response.ok) { const data = await response.json(); throw new Error(data.error || 'Export failed.'); }
+                    if (!response.ok) { const data = await response.json().catch(() => null); throw new Error(data?.error || (response.status === 404 ? 'Export endpoint not found. Restart ComfyUI so the updated Python module loads.' : `Export failed (${response.status}).`)); }
                     const url = URL.createObjectURL(await response.blob());
                     const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'Magik_References_Presets.zip';
                     document.body.append(anchor); anchor.click(); anchor.remove();
@@ -777,19 +868,83 @@ app.registerExtension({
                 finally { importButton.disabled = false; importPicker.value = ''; }
             };
             select.onchange = () => { name.value = select.value; drawGallery(); };
+            const stepPreset = delta => {
+                if (presets.length < 2) return;
+                const current = presets.findIndex(p => p.name === select.value);
+                const target = current < 0 ? (delta > 0 ? 0 : presets.length - 1) : (current + delta + presets.length) % presets.length;
+                select.value = presets[target].name; select.onchange(); persistUi(); load.onclick();
+            };
+            presetPrev.onclick = () => stepPreset(-1);
+            presetNext.onclick = () => stepPreset(1);
             search.oninput = () => { clearTimeout(timer); sequence++; timer = setTimeout(fetchPresets, 200); };
+            const selectedPreset = () => presets.find(p => p.name === select.value);
+            const syncStar = () => {
+                const isFavorite = (selectedPreset()?.favorite || 0) > 0;
+                star.textContent = isFavorite ? '★' : '☆'; star.style.color = isFavorite ? '#e5bd58' : '';
+                star.title = isFavorite ? 'Remove the selected preset from Favorites' : 'Add the selected preset to Favorites';
+                star.setAttribute('aria-label', star.title); star.setAttribute('aria-pressed', String(isFavorite));
+            };
+            const setFavorite = async (presetName, value) => {
+                try {
+                    await post(`${base}/manage`, {action: 'favorite', name: presetName, value});
+                    await fetchPresets(); message(value ? `\u201c${presetName}\u201d added to Favorites.` : `\u201c${presetName}\u201d removed from Favorites.`);
+                } catch (error) { message(error.message, true); }
+            };
+            const reorderFavorites = async (from, to) => {
+                const names = favorites.map(p => p.name), a = names.indexOf(from), b = names.indexOf(to);
+                if (a < 0 || b < 0 || a === b) return;
+                names.splice(b, 0, names.splice(a, 1)[0]);
+                try { await post(`${base}/manage`, {action: 'reorder_favorites', names}); await fetchPresets(); }
+                catch (error) { message(error.message, true); }
+            };
+            const useFavorite = preset => {
+                if ([...select.options].some(option => option.value === preset.name)) select.value = preset.name;
+                applyPreset(preset); persistUi(); syncStar(); drawGallery();
+            };
+            function drawFavorites() {
+                favList.replaceChildren();
+                if (!favorites.length) {
+                    element('span', favList, 'Select a preset and press \u2606 to keep it here for one-click loading.').className = 'favs-hint';
+                    scheduleFit(); return;
+                }
+                const active = lastLoaded ?? select.value;
+                for (const preset of favorites) {
+                    const chip = element('div', favList); chip.className = `fav${preset.name === active ? ' active' : ''}`;
+                    chip.draggable = true; chip.tabIndex = 0; chip.setAttribute('role', 'button');
+                    chip.title = `${preset.name} \u00b7 ${preset.images.length} images \u2014 click to load, drag to reorder`;
+                    const first = preset.images.find(Boolean);
+                    if (first) { const img = element('img', chip); img.loading = 'lazy'; img.alt = ''; img.src = thumb(first); }
+                    else element('span', chip, '\u2205').className = 'fav-empty';
+                    element('span', chip, preset.name).className = 'fav-name';
+                    const unstar = element('button', chip, '★'); unstar.className = 'fav-unstar';
+                    unstar.title = 'Remove from Favorites'; unstar.setAttribute('aria-label', `Remove ${preset.name} from Favorites`);
+                    unstar.onclick = event => { event.stopPropagation(); setFavorite(preset.name, false); };
+                    chip.onclick = () => useFavorite(preset);
+                    chip.onkeydown = event => { if (event.target === chip && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); useFavorite(preset); } };
+                    chip.ondragstart = event => { event.dataTransfer.setData(FAVORITE_MIME, preset.name); event.dataTransfer.effectAllowed = 'move'; };
+                    chip.ondragover = event => { if (event.dataTransfer?.types?.includes(FAVORITE_MIME)) { event.preventDefault(); chip.classList.add('drop'); } };
+                    chip.ondragleave = () => chip.classList.remove('drop');
+                    chip.ondrop = event => {
+                        chip.classList.remove('drop'); const from = event.dataTransfer?.getData(FAVORITE_MIME); if (!from) return;
+                        event.preventDefault(); event.stopPropagation(); reorderFavorites(from, preset.name);
+                    };
+                }
+                scheduleFit();
+            }
+            star.onclick = () => { const preset = selectedPreset(); if (preset) setFavorite(preset.name, !(preset.favorite > 0)); };
+            select.addEventListener('change', () => { lastLoaded = null; syncStar(); drawFavorites(); });
             reload.onclick = fetchPresets;
-            load.onclick = () => {
-                const preset = presets.find(p => p.name === select.value); if (!preset) return;
+            const applyPreset = preset => {
                 undoStack.length = redoStack.length = 0; resetCycle();
                 node.properties.magik_excluded_images = (preset.excluded || []).map(index => preset.images[index]).filter(Boolean);
                 setCount(preset.images.length);
-                fields.forEach((field, i) => { captures[i] = null; field.value = preset.images[i] || ''; });
+                fields.forEach((field, i) => { field.value = preset.images[i] || ''; });
                 outputs.forEach((field, i) => { field.value = preset.outputs?.[i] ?? (i < preset.images.length ? i + 1 : 0); });
                 titleField.value = preset.title || ''; titleInput.value = titleField.value;
                 descriptionField.value = preset.description || ''; descriptionInput.value = descriptionField.value;
-                name.value = preset.name; refresh(); message(`Preset loaded: ${preset.name}`);
+                name.value = preset.name; lastLoaded = preset.name; refresh(); drawFavorites(); message(`Preset loaded: ${preset.name}`);
             };
+            load.onclick = () => { const preset = presets.find(p => p.name === select.value); if (preset) applyPreset(preset); };
             rename.onclick = async () => {
                 try {
                     const old = select.value, next = name.value.trim();
@@ -833,9 +988,8 @@ app.registerExtension({
             const executed = node.onExecuted;
             node.onExecuted = function (data) {
                 const value = executed?.apply(this, arguments);
-                if (Array.isArray(data?.magik_inputs)) data.magik_inputs.slice(0, portCount).forEach((path, i) => { inputCaptures[i] = path || null; });
-                if (Array.isArray(data?.magik_references)) {
-                    data.magik_references.forEach((path, i) => { captures[i] = path || null; });
+                if (Array.isArray(data?.magik_inputs)) {
+                    data.magik_inputs.slice(0, portCount).forEach((path, i) => { inputCaptures[i] = path || null; });
                     refresh(); message('Previews updated. Save captures the connected images from this execution.');
                 }
                 return value;
@@ -887,14 +1041,42 @@ app.registerExtension({
             node.onResize = function () { const value = resized?.apply(this, arguments); scheduleFit(); return value; };
             const configured = node.onConfigure;
             node.onConfigure = function () { const value = configured?.apply(this, arguments);
+                // Freeze persistence until the saved UI state is re-applied, so load-time refreshes cannot overwrite it.
+                const savedUi = arguments[0]?.properties?.magik_ui; uiLocked = true;
                 node.properties ??= {}; resetCycle(); repeatToggle.checked = node.properties.magik_avoid_repeats === true; queueToggle.checked = node.properties.magik_randomize_on_queue === true; updateCardsVisibility();
-                if (node.outputs && !node.outputs.some(output => output.name === 'description' && output.type === 'STRING')) node.addOutput('description', 'STRING'); titleInput.value = titleField.value || ''; descriptionInput.value = descriptionField.value || ''; undoStack.length = redoStack.length = 0; captures.fill(null); inputCaptures.fill(null);
+                if (node.outputs && !node.outputs.some(output => output.name === 'description' && output.type === 'STRING')) node.addOutput('description', 'STRING');
+                if (node.outputs && !node.outputs.some(output => output.name === 'Name' && output.type === 'STRING')) node.addOutput('Name', 'STRING');
+                titleInput.value = titleField.value || ''; descriptionInput.value = descriptionField.value || ''; undoStack.length = redoStack.length = 0; inputCaptures.fill(null);
                 requestAnimationFrame(() => {
                     for (let i = node.inputs.length - 1; i >= 0; i--) if (Number(/^image_(\d+)$/.exec(node.inputs[i].name)?.[1]) > portCount) node.removeInput(i);
+                    restoreUi(savedUi); uiLocked = false;
                     setCount(readExtra().length + portCount);
                 }); return value; };
             const onRemoved = node.onRemoved;
             node.onRemoved = function () { removed = true; queueRandomizers.delete(queueEntry); clearTimeout(timer); resizeObserver?.disconnect(); folderPicker.remove(); closeViewer(); return onRemoved?.apply(this, arguments); };
+            // Group the controls into sections and put them in reading order. This only re-parents elements that
+            // already exist, so the behaviour code above does not care where they sit.
+            const section = (className, heading, ...children) => {
+                const box = document.createElement('div'); box.className = `section ${className}`;
+                if (heading) { const title = document.createElement('div'); title.className = 'section-title'; title.textContent = heading; box.append(title); }
+                box.append(...children); return box;
+            };
+            selectionRow.insertBefore(undoButton, redoButton);                       // Undo before Redo
+            for (const button of root.querySelectorAll('button')) {
+                const text = button.textContent.trim();
+                if (text === 'Randomize' || text === 'Save') button.classList.add('primary');
+                else if (text === 'Delete') button.classList.add('danger');
+            }
+            const options = document.createElement('div'); options.className = 'options';
+            queueRow.className = 'toggle'; repeatRow.className = 'toggle'; options.append(queueRow, repeatRow);
+            const collectionTitle = document.createElement('strong'); collectionTitle.textContent = 'Collection';
+            counter.className = 'count'; collectionRow.classList.add('collection-row'); collectionRow.prepend(collectionTitle); collectionRow.append(cardsToggle);
+            presetsSection.append(favBox, searchRow, presetRow, saveRow, presetToggle, gallery, transferRow);
+            root.append(titleRow, status,
+                section('outputs', 'Outputs', mosaic, selectionRow, options),
+                section('collection', null, collectionRow, folderRow, pathRow, grid),
+                section('details', null, descriptionRow),
+                presetsSection);
             node.setSize([Math.max(defaultWidth, node.size?.[0] || 0), node.computeSize()[1]]); setCount(readExtra().length + portCount); scheduleFit(); fetchPresets();
             return result;
         };
